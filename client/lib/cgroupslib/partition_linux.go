@@ -107,11 +107,23 @@ func (p *partition) Release(cores *idset.Set[hw.CoreID]) error {
 }
 
 func (p *partition) write() error {
+	// 确保目录存在
+	shareDir := filepath.Dir(p.sharePath)
+	if err := os.MkdirAll(shareDir, 0644); err != nil {
+	    return fmt.Errorf("cgroupslib: unable to create directory %s: %w", shareDir, err)
+	}
+	
 	shareStr := p.share.String()
 	if err := os.WriteFile(p.sharePath, []byte(shareStr), 0644); err != nil {
 		return fmt.Errorf("cgroupslib: unable to update share cpuset with %q: %w", shareStr, err)
 	}
 
+	// 确保目录存在
+	reserveDir := filepath.Dir(p.reservePath)
+	if err := os.MkdirAll(reserveDir, 0644); err != nil {
+	    return fmt.Errorf("cgroupslib: unable to create directory %s: %w", reserveDir, err)
+	}
+	
 	reserveStr := p.reserve.String()
 	if err := os.WriteFile(p.reservePath, []byte(reserveStr), 0644); err != nil {
 		return fmt.Errorf("cgroupslib: unable to update reserve cpuset with %q: %w", reserveStr, err)
