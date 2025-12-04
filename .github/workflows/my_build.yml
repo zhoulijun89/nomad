@@ -5,6 +5,13 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      branch:
+        description: "Select the branch to build"
+        required: true
+        type: string
+        default: "main"
+
 
 env:
   PKG_NAME: "nomad"
