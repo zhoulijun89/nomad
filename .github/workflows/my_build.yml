@@ -1,0 +1,90 @@
+name: my_build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  PKG_NAME: "nomad"
+  GO_TAGS: "release"
+
+jobs:
+
+  get-go-version:
+    runs-on: ubuntu-22.04
+    outputs:
+      go-version: ${{ steps.get-go-version.outputs.go-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Determine Go version
+        id: get-go-version
+        run: |
+          echo "go-version=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+
+  get-product-version:
+    runs-on: ubuntu-22.04
+    outputs:
+      product-version: ${{ steps.get-product-version.outputs.product-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: get product version
+        id: get-product-version
+        run: |
+          echo "product-version=$(make version)" >> "$GITHUB_OUTPUT"
+
+  build-linux-amd64:
+    name: Build Linux AMD64
+    needs: [get-go-version, get-product-version]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ needs.get-go-version.outputs.go-version }}
+
+      - name: Build dependencies
+        run: make deps
+
+      - name: Build prerelease
+        run: make prerelease
+
+      - name: Build nomad (linux amd64)
+        env:
+          GOOS: "linux"
+          GOARCH: "amd64"
+          CGO_ENABLED: 1
+          GO_TAGS: ${{ env.GO_TAGS }}
+        run: |
+          go clean -cache
+          make pkg/linux_amd64.zip
+          mv pkg/linux_amd64.zip nomad_${{ needs.get-product-version.outputs.product-version }}_linux_amd64.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nomad_linux_amd64
+          path: nomad_${{ needs.get-product-version.outputs.product-version }}_linux_amd64.zip
+
+  publish-release:
+    name: Publish Release
+    needs: [build-linux-amd64]
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nomad_linux_amd64
+          path: .
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nomad_*_linux_amd64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
