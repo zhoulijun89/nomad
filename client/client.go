@@ -104,7 +104,7 @@ const (
 	// initialHeartbeatStagger is used to stagger the interval between
 	// starting and the initial heartbeat. After the initial heartbeat,
 	// we switch to using the TTL specified by the servers.
-	initialHeartbeatStagger = 10 * time.Second
+	initialHeartbeatStagger = 3 * time.Second
 
 	// nodeUpdateRetryIntv is how often the client checks for updates to the
 	// node attributes or meta map.
@@ -1905,7 +1905,8 @@ func (c *Client) registerAndHeartbeat() {
 				c.retryRegisterNode()
 				heartbeat = time.After(helper.RandomStagger(initialHeartbeatStagger))
 			} else {
-				intv := c.getHeartbeatRetryIntv(err)
+				//intv := c.getHeartbeatRetryIntv(err)
+				intv := helper.RandomStagger(initialHeartbeatStagger)
 				c.logger.Error("error heartbeating. retrying", "error", err, "period", intv)
 				heartbeat = time.After(intv)
 
@@ -1914,7 +1915,8 @@ func (c *Client) registerAndHeartbeat() {
 			}
 		} else {
 			c.heartbeatLock.Lock()
-			heartbeat = time.After(c.heartbeatTTL)
+			//heartbeat = time.After(c.heartbeatTTL)
+			heartbeat = time.After(helper.RandomStagger(initialHeartbeatStagger))
 			c.heartbeatLock.Unlock()
 		}
 	}
