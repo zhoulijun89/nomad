@@ -2187,7 +2187,8 @@ func (c *Client) updateNodeStatus() error {
 	if err != nil {
 		return fmt.Errorf("heartbeat response returned no valid servers")
 	}
-
+	c.logger.Debug("heartbeat success", "node_status", req.Status)
+	
 	// If there's no Leader in the response we may be talking to a partitioned
 	// server. Redo discovery to ensure our server list is up to date.
 	if resp.LeaderRPCAddr == "" {
