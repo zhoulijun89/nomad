@@ -74,6 +74,7 @@ func (h *nodeHeartbeater) initializeHeartbeatTimers() error {
 	defer h.heartbeatTimersLock.Unlock()
 
 	// Handle each node
+	nodeCount := 0
 	for {
 		raw := iter.Next()
 		if raw == nil {
@@ -84,7 +85,11 @@ func (h *nodeHeartbeater) initializeHeartbeatTimers() error {
 			continue
 		}
 		h.resetHeartbeatTimerLocked(node.ID, h.srv.config.FailoverHeartbeatTTL)
+		nodeCount++
 	}
+	h.logger.Info("leader failover: initialized heartbeat timers",
+		"node_count", nodeCount,
+		"failover_ttl", h.srv.config.FailoverHeartbeatTTL)
 	return nil
 }
 
@@ -120,9 +125,15 @@ func (h *nodeHeartbeater) resetHeartbeatTimerLocked(id string, ttl time.Duration
 		h.heartbeatTimers = make(map[string]*time.Timer)
 	}
 
+	expireAt := time.Now().Add(ttl)
+
 	// Renew the heartbeat timer if it exists
 	if timer, ok := h.heartbeatTimers[id]; ok {
 		timer.Reset(ttl)
+		h.logger.Debug("reset existing heartbeat timer",
+			"node_id", id,
+			"ttl", ttl,
+			"expire_at", expireAt)
 		return
 	}
 
@@ -131,6 +142,10 @@ func (h *nodeHeartbeater) resetHeartbeatTimerLocked(id string, ttl time.Duration
 		h.invalidateHeartbeat(id)
 	})
 	h.heartbeatTimers[id] = timer
+	h.logger.Debug("created new heartbeat timer",
+		"node_id", id,
+		"ttl", ttl,
+		"expire_at", expireAt)
 }
 
 // invalidateHeartbeat is invoked when a heartbeat TTL is reached and we
@@ -153,7 +168,10 @@ func (h *nodeHeartbeater) invalidateHeartbeat(id string) {
 		return
 	}
 
-	h.logger.Warn("node TTL expired", "node_id", id)
+	expireTime := time.Now()
+	h.logger.Warn("node TTL expired",
+		"node_id", id,
+		"expire_time", expireTime)
 
 	canDisconnect, hasPendingReconnects := h.disconnectState(id)
 
@@ -168,9 +186,18 @@ func (h *nodeHeartbeater) invalidateHeartbeat(id string) {
 		},
 	}
 
+	newStatus := structs.NodeStatusDown
 	if canDisconnect && hasPendingReconnects {
 		req.Status = structs.NodeStatusDisconnected
+		newStatus = structs.NodeStatusDisconnected
 	}
+
+	h.logger.Warn("marking node as unavailable due to missed heartbeat",
+		"node_id", id,
+		"new_status", newStatus,
+		"can_disconnect", canDisconnect,
+		"has_pending_reconnects", hasPendingReconnects)
+
 	var resp structs.NodeUpdateResponse
 
 	if err := h.srv.RPC("Node.UpdateStatus", &req, &resp); err != nil {

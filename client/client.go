@@ -84,7 +84,7 @@ const (
 
 	// registerRetryIntv is minimum interval on which we retry
 	// registration. We pick a value between this and 2x this.
-	registerRetryIntv = 15 * time.Second
+	registerRetryIntv = 3 * time.Second
 
 	// getAllocRetryIntv is minimum interval on which we retry
 	// to fetch allocations. We pick a value between this and 2x this.
@@ -1827,16 +1827,26 @@ func (c *Client) registerAndHeartbeat() {
 			// registered before
 			if strings.Contains(err.Error(), "node not found") {
 				// Re-register the node
-				c.logger.Info("re-registering node")
+				startReregister := time.Now()
+				c.logger.Warn("node not found on server, starting re-registration",
+					"error", err,
+					"time", startReregister)
 				c.retryRegisterNode()
+				reregisterDuration := time.Since(startReregister)
+				c.logger.Info("re-registration completed",
+					"duration", reregisterDuration)
 				heartbeat = time.After(helper.RandomStagger(initialHeartbeatStagger))
 			} else {
 				//intv := c.getHeartbeatRetryIntv(err)
 				intv := helper.RandomStagger(initialHeartbeatStagger)
-				c.logger.Error("error heartbeating. retrying", "error", err, "period", intv)
+				c.logger.Error("error heartbeating. retrying",
+					"error", err,
+					"retry_period", intv,
+					"error_type", fmt.Sprintf("%T", err))
 				heartbeat = time.After(intv)
-				
+
 				// If heartbeating fails, trigger Consul discovery
+				c.logger.Debug("heartbeat failed, triggering server discovery")
 				c.triggerDiscovery()
 			}
 		} else {
@@ -2021,13 +2031,26 @@ func (c *Client) triggerNodeEvent(nodeEvent *structs.NodeEvent) {
 func (c *Client) retryRegisterNode() {
 
 	authToken := c.getRegistrationToken()
+	attemptNum := 0
 
 	for {
+		attemptNum++
+		attemptStart := time.Now()
+		c.logger.Debug("attempting node registration", "attempt", attemptNum)
+
 		err := c.registerNode(authToken)
 		if err == nil {
 			// Registered!
+			c.logger.Info("node registration succeeded",
+				"attempt", attemptNum,
+				"duration", time.Since(attemptStart))
 			return
 		}
+
+		c.logger.Warn("node registration failed",
+			"attempt", attemptNum,
+			"error", err,
+			"duration", time.Since(attemptStart))
 
 		retryIntv := registerRetryIntv
 		if err == noServersErr || structs.IsErrNoRegionPath(err) {
@@ -2044,9 +2067,20 @@ func (c *Client) retryRegisterNode() {
 		} else {
 			c.logger.Error("error registering", "error", err)
 		}
+
+		actualRetryIntv := c.retryIntv(retryIntv)
+		c.logger.Info("waiting before next registration attempt",
+			"retry_interval", actualRetryIntv,
+			"base_interval", retryIntv)
+
+		retryWaitStart := time.Now()
 		select {
 		case <-c.rpcRetryWatcher():
-		case <-time.After(c.retryIntv(retryIntv)):
+			c.logger.Debug("retry triggered by RPC watcher",
+				"waited", time.Since(retryWaitStart))
+		case <-time.After(actualRetryIntv):
+			c.logger.Debug("retry triggered by timeout",
+				"waited", time.Since(retryWaitStart))
 		case <-c.shutdownCh:
 			return
 		}
@@ -2187,11 +2221,16 @@ func (c *Client) updateNodeStatus() error {
 	if err != nil {
 		return fmt.Errorf("heartbeat response returned no valid servers")
 	}
-	c.logger.Debug("heartbeat success", "node_status", req.Status)
-	
+	c.logger.Debug("heartbeat success",
+		"node_status", req.Status,
+		"heartbeat_ttl", resp.HeartbeatTTL,
+		"req_latency", endTime.Sub(start),
+		"since_last_heartbeat", time.Since(last))
+
 	// If there's no Leader in the response we may be talking to a partitioned
 	// server. Redo discovery to ensure our server list is up to date.
 	if resp.LeaderRPCAddr == "" {
+		c.logger.Warn("no leader in heartbeat response, triggering discovery")
 		c.triggerDiscovery()
 	}
 
