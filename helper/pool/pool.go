@@ -373,10 +373,20 @@ func (p *ConnPool) acquire(region string, addr net.Addr) (*Conn, error) {
 func (p *ConnPool) getNewConn(region string, addr net.Addr) (*Conn, error) {
 	// Try to dial the conn
 	// 使用 2 秒超时以快速检测网络故障（如网口 down）
+	dialStart := time.Now()
+	p.logger.Printf("[DEBUG] attempting TCP connection to %s", addr.String())
+
 	conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+	dialDuration := time.Since(dialStart)
+
 	if err != nil {
+		p.logger.Printf("[WARN] TCP connection failed to %s: duration=%s error=%v",
+			addr.String(), dialDuration, err)
 		return nil, err
 	}
+
+	p.logger.Printf("[DEBUG] TCP connection succeeded to %s: duration=%s",
+		addr.String(), dialDuration)
 
 	// Cast to TCPConn
 	if tcp, ok := conn.(*net.TCPConn); ok {
@@ -450,27 +460,41 @@ func (p *ConnPool) clearConn(conn *Conn) {
 
 // getClient is used to get a usable client for an address
 func (p *ConnPool) getRPCClient(region string, addr net.Addr) (*Conn, *StreamClient, error) {
+	startTime := time.Now()
 	retries := 0
+	p.logger.Printf("[DEBUG] getRPCClient starting for %s", addr.String())
+
 START:
+	attemptStart := time.Now()
 	// Try to get a conn first
 	conn, err := p.acquire(region, addr)
 	if err != nil {
+		p.logger.Printf("[ERROR] failed to acquire connection to %s: duration=%s error=%v",
+			addr.String(), time.Since(startTime), err)
 		return nil, nil, fmt.Errorf("failed to get conn: %v", err)
 	}
 
 	// Get a client
 	client, err := conn.getRPCClient()
 	if err != nil {
+		p.logger.Printf("[WARN] failed to get RPC client from connection to %s: attempt=%d duration=%s error=%v",
+			addr.String(), retries+1, time.Since(attemptStart), err)
 		p.clearConn(conn)
 		conn.releaseUse()
 
 		// Try to redial, possible that the TCP session closed due to timeout
 		if retries == 0 {
 			retries++
+			p.logger.Printf("[DEBUG] retrying getRPCClient for %s (retry %d)", addr.String(), retries)
 			goto START
 		}
+		p.logger.Printf("[ERROR] getRPCClient exhausted retries for %s: total_duration=%s",
+			addr.String(), time.Since(startTime))
 		return nil, nil, fmt.Errorf("failed to start stream: %v", err)
 	}
+
+	p.logger.Printf("[DEBUG] getRPCClient succeeded for %s: retries=%d total_duration=%s",
+		addr.String(), retries, time.Since(startTime))
 	return conn, client, nil
 }
 
@@ -497,16 +521,27 @@ func (p *ConnPool) StreamingRPC(region string, addr net.Addr) (net.Conn, error) 
 
 // RPC is used to make an RPC call to a remote host
 func (p *ConnPool) RPC(region string, addr net.Addr, method string, args interface{}, reply interface{}) error {
+	rpcStart := time.Now()
+	p.logger.Printf("[DEBUG] ConnPool.RPC starting: server=%s method=%s", addr.String(), method)
+
 	// Get a usable client
 	conn, sc, err := p.getRPCClient(region, addr)
 	if err != nil {
+		p.logger.Printf("[ERROR] ConnPool.RPC failed to get client: server=%s method=%s duration=%s error=%v",
+			addr.String(), method, time.Since(rpcStart), err)
 		return fmt.Errorf("rpc error: %w", err)
 	}
 	defer conn.releaseUse()
 
 	// Make the RPC call
+	callStart := time.Now()
+	p.logger.Printf("[DEBUG] making RPC call: server=%s method=%s", addr.String(), method)
 	err = msgpackrpc.CallWithCodec(sc.codec, method, args, reply)
+	callDuration := time.Since(callStart)
+
 	if err != nil {
+		p.logger.Printf("[ERROR] RPC call failed: server=%s method=%s call_duration=%s total_duration=%s error=%v",
+			addr.String(), method, callDuration, time.Since(rpcStart), err)
 		sc.Close()
 
 		// If we read EOF, the session is toast. Clear it and open a
@@ -525,6 +560,9 @@ func (p *ConnPool) RPC(region string, addr net.Addr, method string, args interfa
 		// TODO wrap with RPCCoded error instead
 		return fmt.Errorf("rpc error: %w", err)
 	}
+
+	p.logger.Printf("[DEBUG] RPC call succeeded: server=%s method=%s call_duration=%s total_duration=%s",
+		addr.String(), method, callDuration, time.Since(rpcStart))
 
 	// Done with the connection
 	conn.returnClient(sc)

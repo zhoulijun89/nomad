@@ -81,6 +81,7 @@ func (c *Client) rpc(method string, args any, reply any) error {
 
 	// We will try to automatically retry requests that fail due to things like server unavailability
 	// but instead of retrying forever, lets have a solid upper-bound
+	rpcStartTime := time.Now()
 	deadline := time.Now()
 
 	// A reasonable amount of time for leader election. Note when servers forward() our RPC requests
@@ -96,17 +97,50 @@ func (c *Client) rpc(method string, args any, reply any) error {
 		defer info.SetTimeToBlock(oldBlockTime)
 	}
 
+	c.rpcLogger.Debug("starting RPC call",
+		"method", method,
+		"deadline", conf.RPCHoldTimeout,
+		"total_deadline", time.Until(deadline))
+
+	attemptNum := 0
+
 TRY:
+	attemptNum++
+	attemptStart := time.Now()
 	var rpcErr error
 
 	server := c.servers.FindServer()
 	if server == nil {
 		rpcErr = noServersErr
+		c.rpcLogger.Warn("no servers available for RPC",
+			"method", method,
+			"attempt", attemptNum)
 	} else {
+		c.rpcLogger.Debug("attempting RPC to server",
+			"method", method,
+			"server", server.Addr,
+			"attempt", attemptNum,
+			"time_since_start", time.Since(rpcStartTime))
+
 		// Make the request.
 		rpcErr = c.connPool.RPC(c.Region(), server.Addr, method, args, reply)
 
+		attemptDuration := time.Since(attemptStart)
+		c.rpcLogger.Debug("RPC attempt completed",
+			"method", method,
+			"server", server.Addr,
+			"attempt", attemptNum,
+			"duration", attemptDuration,
+			"success", rpcErr == nil,
+			"error", rpcErr)
+
 		if rpcErr == nil {
+			totalDuration := time.Since(rpcStartTime)
+			c.rpcLogger.Debug("RPC call succeeded",
+				"method", method,
+				"server", server.Addr,
+				"total_duration", totalDuration,
+				"attempts", attemptNum)
 			c.fireRpcRetryWatcher()
 			return nil
 		}
@@ -123,12 +157,23 @@ TRY:
 		c.servers.NotifyFailedServer(server)
 
 		if !canRetry(args, rpcErr) {
-			c.rpcLogger.Error("error performing RPC to server which is not safe to automatically retry", "error", rpcErr, "rpc", method, "server", server.Addr)
+			c.rpcLogger.Error("error performing RPC to server which is not safe to automatically retry",
+				"error", rpcErr,
+				"rpc", method,
+				"server", server.Addr,
+				"total_duration", time.Since(rpcStartTime))
 			return rpcErr
 		}
 	}
 
-	if time.Now().After(deadline) {
+	now := time.Now()
+	if now.After(deadline) {
+		c.rpcLogger.Warn("RPC deadline exceeded",
+			"method", method,
+			"deadline", conf.RPCHoldTimeout,
+			"elapsed", time.Since(rpcStartTime),
+			"attempts", attemptNum,
+			"last_error", rpcErr)
 		// Blocking queries are tricky.  jitters and rpcholdtimes in multiple
 		// places can result in our server call taking longer than we wanted it
 		// to. For example: a block time of 5s may easily turn into the server
@@ -144,11 +189,22 @@ TRY:
 	}
 
 	// Wait to avoid thundering herd
-	timer, cancel := helper.NewSafeTimer(helper.RandomStagger(conf.RPCHoldTimeout / structs.JitterFraction))
+	jitterDelay := helper.RandomStagger(conf.RPCHoldTimeout / structs.JitterFraction)
+	c.rpcLogger.Debug("waiting before retry",
+		"method", method,
+		"jitter_delay", jitterDelay,
+		"elapsed", time.Since(rpcStartTime),
+		"remaining_time", time.Until(deadline))
+
+	timer, cancel := helper.NewSafeTimer(jitterDelay)
 	defer cancel()
 
 	select {
 	case <-timer.C:
+		c.rpcLogger.Debug("retry timer expired, retrying RPC",
+			"method", method,
+			"elapsed", time.Since(rpcStartTime))
+
 		// If we are going to retry a blocking query we need to update the time
 		// to block so it finishes by our deadline.
 
@@ -165,6 +221,8 @@ TRY:
 
 		goto TRY
 	case <-c.shutdownCh:
+		c.rpcLogger.Debug("RPC cancelled due to shutdown",
+			"method", method)
 	}
 	return rpcErr
 }
