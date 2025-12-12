@@ -372,7 +372,8 @@ func (p *ConnPool) acquire(region string, addr net.Addr) (*Conn, error) {
 // getNewConn is used to return a new connection
 func (p *ConnPool) getNewConn(region string, addr net.Addr) (*Conn, error) {
 	// Try to dial the conn
-	conn, err := net.DialTimeout("tcp", addr.String(), 10*time.Second)
+	// 使用 2 秒超时以快速检测网络故障（如网口 down）
+	conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
 	if err != nil {
 		return nil, err
 	}

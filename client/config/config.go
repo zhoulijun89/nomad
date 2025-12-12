@@ -910,7 +910,7 @@ func DefaultConfig() *Config {
 		NoHostUUID:              true,
 		DisableRemoteExec:       false,
 		TemplateConfig:          DefaultTemplateConfig(),
-		RPCHoldTimeout:          5 * time.Second,
+		RPCHoldTimeout:          2 * time.Second,
 		RPCSessionConfig:        yamux.DefaultConfig(),
 		CNIPath:                 "/opt/cni/bin",
 		CNIConfigDir:            "/opt/cni/config",

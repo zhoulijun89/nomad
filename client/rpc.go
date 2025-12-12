@@ -220,7 +220,8 @@ func bridgedStreamingRpcHandler(sideA io.ReadWriteCloser) structs.StreamingRpcHa
 // streaming RPC.
 func (c *Client) streamingRpcConn(server *servers.Server, method string) (net.Conn, error) {
 	// Dial the server
-	conn, err := net.DialTimeout("tcp", server.Addr.String(), 10*time.Second)
+	// 使用 2 秒超时以快速检测网络故障
+	conn, err := net.DialTimeout("tcp", server.Addr.String(), 2*time.Second)
 	if err != nil {
 		return nil, err
 	}

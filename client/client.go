@@ -1830,11 +1830,13 @@ func (c *Client) registerAndHeartbeat() {
 				startReregister := time.Now()
 				c.logger.Warn("node not found on server, starting re-registration",
 					"error", err,
-					"time", startReregister)
+					"time", startReregister,
+					"since_last_heartbeat", time.Since(c.lastHeartbeat()))
 				c.retryRegisterNode()
 				reregisterDuration := time.Since(startReregister)
 				c.logger.Info("re-registration completed",
-					"duration", reregisterDuration)
+					"duration", reregisterDuration,
+					"since_last_heartbeat", time.Since(c.lastHeartbeat()))
 				heartbeat = time.After(helper.RandomStagger(initialHeartbeatStagger))
 			} else {
 				//intv := c.getHeartbeatRetryIntv(err)
@@ -1842,7 +1844,8 @@ func (c *Client) registerAndHeartbeat() {
 				c.logger.Error("error heartbeating. retrying",
 					"error", err,
 					"retry_period", intv,
-					"error_type", fmt.Sprintf("%T", err))
+					"error_type", fmt.Sprintf("%T", err),
+					"since_last_heartbeat", time.Since(c.lastHeartbeat()))
 				heartbeat = time.After(intv)
 
 				// If heartbeating fails, trigger Consul discovery
