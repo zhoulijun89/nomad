@@ -576,10 +576,26 @@ func (p *ConnPool) StreamingRPC(region string, addr net.Addr) (net.Conn, error) 
 	return s, nil
 }
 
+// getRPCTimeout 根据 RPC 方法返回合适的超时时间
+func getRPCTimeout(method string) time.Duration {
+	switch method {
+	case "Node.UpdateStatus":
+		// 心跳请求，使用 2 秒快速超时以实现快速故障检测
+		return 2 * time.Second
+	case "Node.Register":
+		// 节点注册，使用 2 秒快速超时以实现快速故障检测
+		return 2 * time.Second
+	default:
+		// 默认 10 秒超时，适用于大多数 RPC
+		return 10 * time.Second
+	}
+}
+
 // RPC is used to make an RPC call to a remote host
 func (p *ConnPool) RPC(region string, addr net.Addr, method string, args interface{}, reply interface{}) error {
 	rpcStart := time.Now()
-	p.logger.Printf("[DEBUG] ConnPool.RPC starting: server=%s method=%s", addr.String(), method)
+	timeout := getRPCTimeout(method)
+	p.logger.Printf("[DEBUG] ConnPool.RPC starting: server=%s method=%s timeout=%s", addr.String(), method, timeout)
 
 	// Get a usable client
 	conn, sc, err := p.getRPCClient(region, addr)
@@ -592,11 +608,11 @@ func (p *ConnPool) RPC(region string, addr net.Addr, method string, args interfa
 
 	// Make the RPC call
 	callStart := time.Now()
-	p.logger.Printf("[DEBUG] making RPC call: server=%s method=%s", addr.String(), method)
+	p.logger.Printf("[DEBUG] making RPC call: server=%s method=%s timeout=%s", addr.String(), method, timeout)
 
 	// Set read/write deadline to prevent hanging forever
-	// 设置 10 秒读写超时，防止永久挂起
-	deadline := time.Now().Add(2 * time.Second)
+	// 根据不同的 RPC 方法设置不同的超时时间
+	deadline := time.Now().Add(timeout)
 	if err := sc.stream.SetDeadline(deadline); err != nil {
 		p.logger.Printf("[WARN] failed to set deadline on stream: %v", err)
 	}
@@ -610,8 +626,8 @@ func (p *ConnPool) RPC(region string, addr net.Addr, method string, args interfa
 	}
 
 	if err != nil {
-		p.logger.Printf("[ERROR] RPC call failed: server=%s method=%s call_duration=%s total_duration=%s error=%v",
-			addr.String(), method, callDuration, time.Since(rpcStart), err)
+		p.logger.Printf("[ERROR] RPC call failed: server=%s method=%s call_duration=%s total_duration=%s timeout=%s error=%v",
+			addr.String(), method, callDuration, time.Since(rpcStart), timeout, err)
 		sc.Close()
 
 		// If we read EOF, the session is toast. Clear it and open a
@@ -631,8 +647,8 @@ func (p *ConnPool) RPC(region string, addr net.Addr, method string, args interfa
 		return fmt.Errorf("rpc error: %w", err)
 	}
 
-	p.logger.Printf("[DEBUG] RPC call succeeded: server=%s method=%s call_duration=%s total_duration=%s",
-		addr.String(), method, callDuration, time.Since(rpcStart))
+	p.logger.Printf("[DEBUG] RPC call succeeded: server=%s method=%s call_duration=%s total_duration=%s timeout=%s",
+		addr.String(), method, callDuration, time.Since(rpcStart), timeout)
 
 	// Done with the connection
 	conn.returnClient(sc)
