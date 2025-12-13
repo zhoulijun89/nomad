@@ -92,14 +92,28 @@ func (c *Conn) getRPCClient() (*StreamClient, error) {
 	}
 
 	// Open a new session
+	// session.Open() 可能会阻塞，yamux 配置中的 StreamOpenTimeout 控制这个
 	stream, err := c.session.Open()
 	if err != nil {
 		return nil, err
 	}
 
+	// Set a deadline for the initial write
+	// 为初始写入设置 2 秒超时
+	if err := stream.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("failed to set stream deadline: %w", err)
+	}
+
 	if _, err := stream.Write([]byte{byte(RpcNomad)}); err != nil {
 		stream.Close()
 		return nil, err
+	}
+
+	// Clear deadline, will be set by caller if needed
+	if err := stream.SetDeadline(time.Time{}); err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("failed to clear stream deadline: %w", err)
 	}
 
 	// Create a client codec
@@ -351,10 +365,18 @@ func (p *ConnPool) acquire(region string, addr net.Addr) (*Conn, error) {
 
 	// Otherwise, wait for the lead thread to attempt the connection
 	// and use what's in the pool at that point.
+	// 添加超时避免永久等待
+	waitTimeout := time.NewTimer(2 * time.Second)
+	defer waitTimeout.Stop()
+
 	select {
 	case <-p.shutdownCh:
 		return nil, fmt.Errorf("rpc error: shutdown")
 	case <-wait:
+		// Lead thread completed
+	case <-waitTimeout.C:
+		p.logger.Printf("[ERROR] timeout waiting for lead thread to create connection to %s", addr.String())
+		return nil, fmt.Errorf("rpc error: timeout waiting for connection")
 	}
 
 	// See if the lead thread was able to get us a connection.
@@ -394,19 +416,26 @@ func (p *ConnPool) getNewConn(region string, addr net.Addr) (*Conn, error) {
 		tcp.SetNoDelay(true)
 	}
 
+	// Set a timeout for the initial handshake and setup
+	// 为握手和初始化设置 5 秒超时，防止挂起
+	handshakeDeadline := time.Now().Add(2 * time.Second)
+	if err := conn.SetDeadline(handshakeDeadline); err != nil {
+		p.logger.Printf("[WARN] failed to set handshake deadline: %v", err)
+	}
+
 	// Check if TLS is enabled
 	if p.tlsWrap != nil {
 		// Switch the connection into TLS mode
 		if _, err := conn.Write([]byte{byte(RpcTLS)}); err != nil {
 			conn.Close()
-			return nil, err
+			return nil, fmt.Errorf("failed to write TLS byte: %w", err)
 		}
 
 		// Wrap the connection in a TLS client
 		tlsConn, err := p.tlsWrap(region, conn)
 		if err != nil {
 			conn.Close()
-			return nil, err
+			return nil, fmt.Errorf("TLS wrap failed: %w", err)
 		}
 		conn = tlsConn
 	}
@@ -414,14 +443,20 @@ func (p *ConnPool) getNewConn(region string, addr net.Addr) (*Conn, error) {
 	// Write the multiplex byte to set the mode
 	if _, err := conn.Write([]byte{byte(RpcMultiplexV2)}); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("failed to write multiplex byte: %w", err)
 	}
 
 	// Create a multiplexed session
 	session, err := yamux.Client(conn, p.yamuxCfg)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("yamux client creation failed: %w", err)
+	}
+
+	// Clear the deadline after handshake completes
+	// 握手完成后清除 deadline，后续由 RPC 层控制
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		p.logger.Printf("[WARN] failed to clear handshake deadline: %v", err)
 	}
 
 	// Wrap the connection
@@ -462,9 +497,17 @@ func (p *ConnPool) clearConn(conn *Conn) {
 func (p *ConnPool) getRPCClient(region string, addr net.Addr) (*Conn, *StreamClient, error) {
 	startTime := time.Now()
 	retries := 0
-	p.logger.Printf("[DEBUG] getRPCClient starting for %s", addr.String())
+	timeout := 2 * time.Second // 总超时时间
+	p.logger.Printf("[DEBUG] getRPCClient starting for %s timeout=%s", addr.String(), timeout)
 
 START:
+	// 检查总超时
+	if time.Since(startTime) > timeout {
+		p.logger.Printf("[ERROR] getRPCClient total timeout exceeded for %s: duration=%s",
+			addr.String(), time.Since(startTime))
+		return nil, nil, fmt.Errorf("getRPCClient timeout after %s", time.Since(startTime))
+	}
+
 	attemptStart := time.Now()
 	// Try to get a conn first
 	conn, err := p.acquire(region, addr)
@@ -511,9 +554,23 @@ func (p *ConnPool) StreamingRPC(region string, addr net.Addr) (net.Conn, error) 
 		return nil, fmt.Errorf("failed to open a streaming connection: %v", err)
 	}
 
+	// Set deadline for initial write
+	// 为初始写入设置 3 秒超时
+	if err := s.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("failed to set deadline: %w", err)
+	}
+
 	if _, err := s.Write([]byte{byte(RpcStreaming)}); err != nil {
 		conn.Close()
 		return nil, err
+	}
+
+	// Clear deadline, caller will manage timeouts
+	// 清除 deadline，由调用方管理超时
+	if err := s.SetDeadline(time.Time{}); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("failed to clear deadline: %w", err)
 	}
 
 	return s, nil
@@ -536,8 +593,21 @@ func (p *ConnPool) RPC(region string, addr net.Addr, method string, args interfa
 	// Make the RPC call
 	callStart := time.Now()
 	p.logger.Printf("[DEBUG] making RPC call: server=%s method=%s", addr.String(), method)
+
+	// Set read/write deadline to prevent hanging forever
+	// 设置 10 秒读写超时，防止永久挂起
+	deadline := time.Now().Add(2 * time.Second)
+	if err := sc.stream.SetDeadline(deadline); err != nil {
+		p.logger.Printf("[WARN] failed to set deadline on stream: %v", err)
+	}
+
 	err = msgpackrpc.CallWithCodec(sc.codec, method, args, reply)
 	callDuration := time.Since(callStart)
+
+	// Clear the deadline after the call
+	if err := sc.stream.SetDeadline(time.Time{}); err != nil {
+		p.logger.Printf("[WARN] failed to clear deadline on stream: %v", err)
+	}
 
 	if err != nil {
 		p.logger.Printf("[ERROR] RPC call failed: server=%s method=%s call_duration=%s total_duration=%s error=%v",

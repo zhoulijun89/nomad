@@ -5,6 +5,7 @@ package client
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/rpc"
@@ -290,6 +291,13 @@ func (c *Client) streamingRpcConn(server *servers.Server, method string) (net.Co
 		tcp.SetNoDelay(true)
 	}
 
+	// Set a timeout for the streaming RPC handshake
+	// 为流式 RPC 握手设置 5 秒超时
+	handshakeDeadline := time.Now().Add(2 * time.Second)
+	if err := conn.SetDeadline(handshakeDeadline); err != nil {
+		c.logger.Warn("failed to set streaming handshake deadline", "error", err)
+	}
+
 	// Check if TLS is enabled
 	c.tlsWrapLock.RLock()
 	tlsWrap := c.tlsWrap
@@ -299,14 +307,14 @@ func (c *Client) streamingRpcConn(server *servers.Server, method string) (net.Co
 		// Switch the connection into TLS mode
 		if _, err := conn.Write([]byte{byte(pool.RpcTLS)}); err != nil {
 			conn.Close()
-			return nil, err
+			return nil, fmt.Errorf("failed to write TLS byte: %w", err)
 		}
 
 		// Wrap the connection in a TLS client
 		tlsConn, err := tlsWrap(c.Region(), conn)
 		if err != nil {
 			conn.Close()
-			return nil, err
+			return nil, fmt.Errorf("TLS wrap failed: %w", err)
 		}
 		conn = tlsConn
 	}
@@ -314,7 +322,7 @@ func (c *Client) streamingRpcConn(server *servers.Server, method string) (net.Co
 	// Write the multiplex byte to set the mode
 	if _, err := conn.Write([]byte{byte(pool.RpcStreaming)}); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("failed to write streaming byte: %w", err)
 	}
 
 	// Send the header
@@ -325,7 +333,13 @@ func (c *Client) streamingRpcConn(server *servers.Server, method string) (net.Co
 	}
 	if err := encoder.Encode(header); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("failed to encode header: %w", err)
+	}
+
+	// Clear deadline after handshake
+	// 握手完成后清除 deadline
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		c.logger.Warn("failed to clear streaming handshake deadline", "error", err)
 	}
 
 	// Wait for the acknowledgement
