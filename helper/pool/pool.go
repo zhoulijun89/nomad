@@ -587,7 +587,7 @@ func getRPCTimeout(method string) time.Duration {
 		return 2 * time.Second
 	default:
 		// 默认 10 秒超时，适用于大多数 RPC
-		return 60 * time.Second
+		return 600 * time.Second
 	}
 }
 
