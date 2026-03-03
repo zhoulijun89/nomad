@@ -463,7 +463,7 @@ func (a *allocReconciler) computeGroup(groupName string, all allocSet) bool {
 	desiredChanges.Ignore += uint64(len(ignore))
 
 	// Determine what set of terminal allocations need to be rescheduled
-	untainted, rescheduleNow, rescheduleLater := untainted.filterByRescheduleable(a.batch, false, a.now, a.evalID, a.deployment)
+	untainted, rescheduleNow, rescheduleLater := untainted.filterByRescheduleable(a.logger, a.batch, false, a.now, a.evalID, a.deployment)
 
 	// If there are allocations reconnecting we need to reconcile them and
 	// their replacements first because there is specific logic when deciding
@@ -506,7 +506,7 @@ func (a *allocReconciler) computeGroup(groupName string, all allocSet) bool {
 	timeoutLaterEvals := map[string]string{}
 	if len(disconnecting) > 0 {
 		if tg.GetDisconnectLostTimeout() != 0 {
-			untaintedDisconnecting, rescheduleDisconnecting, laterDisconnecting := disconnecting.filterByRescheduleable(a.batch, true, a.now, a.evalID, a.deployment)
+			untaintedDisconnecting, rescheduleDisconnecting, laterDisconnecting := disconnecting.filterByRescheduleable(a.logger, a.batch, true, a.now, a.evalID, a.deployment)
 
 			rescheduleNow = rescheduleNow.union(rescheduleDisconnecting)
 			untainted = untainted.union(untaintedDisconnecting)

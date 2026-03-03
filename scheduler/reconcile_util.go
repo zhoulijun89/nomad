@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/hashicorp/go-hclog"
+
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -404,7 +406,7 @@ func (a allocSet) filterByTainted(taintedNodes map[string]*structs.Node, serverS
 // untainted or a set of allocations that must be rescheduled now. Allocations that can be rescheduled
 // at a future time are also returned so that we can create follow up evaluations for them. Allocs are
 // skipped or considered untainted according to logic defined in shouldFilter method.
-func (a allocSet) filterByRescheduleable(isBatch, isDisconnecting bool, now time.Time, evalID string, deployment *structs.Deployment) (allocSet, allocSet, []*delayedRescheduleInfo) {
+func (a allocSet) filterByRescheduleable(logger log.Logger, isBatch, isDisconnecting bool, now time.Time, evalID string, deployment *structs.Deployment) (allocSet, allocSet, []*delayedRescheduleInfo) {
 	untainted := make(map[string]*structs.Allocation)
 	rescheduleNow := make(map[string]*structs.Allocation)
 	rescheduleLater := []*delayedRescheduleInfo{}
@@ -413,6 +415,12 @@ func (a allocSet) filterByRescheduleable(isBatch, isDisconnecting bool, now time
 		// Ignore disconnecting allocs that are already unknown. This can happen
 		// in the case of canaries that are interrupted by a disconnect.
 		if isDisconnecting && alloc.ClientStatus == structs.AllocClientStatusUnknown {
+			logger.Warn("reschedule: skipping alloc - disconnecting and already unknown",
+				"alloc_id", alloc.ID,
+				"job_id", alloc.JobID,
+				"task_group", alloc.TaskGroup,
+				"client_status", alloc.ClientStatus,
+			)
 			continue
 		}
 
@@ -423,21 +431,52 @@ func (a allocSet) filterByRescheduleable(isBatch, isDisconnecting bool, now time
 		// Only failed or disconnecting allocs should be rescheduled.
 		// Protects against a bug allowing rescheduling running allocs.
 		if alloc.NextAllocation != "" && alloc.TerminalStatus() {
+			logger.Warn("reschedule: skipping alloc - already has next allocation",
+				"alloc_id", alloc.ID,
+				"job_id", alloc.JobID,
+				"task_group", alloc.TaskGroup,
+				"next_alloc_id", alloc.NextAllocation,
+				"client_status", alloc.ClientStatus,
+				"desired_status", alloc.DesiredStatus,
+			)
 			continue
 		}
 
 		isUntainted, ignore := shouldFilter(alloc, isBatch)
 		if isUntainted && !isDisconnecting {
+			logger.Warn("reschedule: alloc marked as untainted - will not reschedule",
+				"alloc_id", alloc.ID,
+				"job_id", alloc.JobID,
+				"task_group", alloc.TaskGroup,
+				"client_status", alloc.ClientStatus,
+				"desired_status", alloc.DesiredStatus,
+				"is_batch", isBatch,
+			)
 			untainted[alloc.ID] = alloc
 			continue // these allocs can never be rescheduled, so skip checking
 		}
 
 		if ignore {
+			logger.Warn("reschedule: alloc ignored by shouldFilter",
+				"alloc_id", alloc.ID,
+				"job_id", alloc.JobID,
+				"task_group", alloc.TaskGroup,
+				"client_status", alloc.ClientStatus,
+				"desired_status", alloc.DesiredStatus,
+				"is_batch", isBatch,
+			)
 			continue
 		}
 
-		eligibleNow, eligibleLater, rescheduleTime = updateByReschedulable(alloc, now, evalID, deployment, isDisconnecting)
+		eligibleNow, eligibleLater, rescheduleTime = updateByReschedulable(logger, alloc, now, evalID, deployment, isDisconnecting)
 		if eligibleNow {
+			logger.Warn("reschedule: alloc eligible for reschedule NOW",
+				"alloc_id", alloc.ID,
+				"job_id", alloc.JobID,
+				"task_group", alloc.TaskGroup,
+				"client_status", alloc.ClientStatus,
+				"reschedule_time", rescheduleTime,
+			)
 			rescheduleNow[alloc.ID] = alloc
 			continue
 		}
@@ -447,7 +486,23 @@ func (a allocSet) filterByRescheduleable(isBatch, isDisconnecting bool, now time
 		untainted[alloc.ID] = alloc
 
 		if eligibleLater {
+			logger.Warn("reschedule: alloc eligible for reschedule LATER",
+				"alloc_id", alloc.ID,
+				"job_id", alloc.JobID,
+				"task_group", alloc.TaskGroup,
+				"client_status", alloc.ClientStatus,
+				"reschedule_time", rescheduleTime,
+				"delay", rescheduleTime.Sub(now),
+			)
 			rescheduleLater = append(rescheduleLater, &delayedRescheduleInfo{alloc.ID, alloc, rescheduleTime})
+		} else {
+			logger.Warn("reschedule: alloc NOT eligible for reschedule",
+				"alloc_id", alloc.ID,
+				"job_id", alloc.JobID,
+				"task_group", alloc.TaskGroup,
+				"client_status", alloc.ClientStatus,
+				"desired_status", alloc.DesiredStatus,
+			)
 		}
 
 	}
@@ -513,15 +568,26 @@ func shouldFilter(alloc *structs.Allocation, isBatch bool) (untainted, ignore bo
 
 // updateByReschedulable is a helper method that encapsulates logic for whether a failed allocation
 // should be rescheduled now, later or left in the untainted set
-func updateByReschedulable(alloc *structs.Allocation, now time.Time, evalID string, d *structs.Deployment, isDisconnecting bool) (rescheduleNow, rescheduleLater bool, rescheduleTime time.Time) {
+func updateByReschedulable(logger log.Logger, alloc *structs.Allocation, now time.Time, evalID string, d *structs.Deployment, isDisconnecting bool) (rescheduleNow, rescheduleLater bool, rescheduleTime time.Time) {
 	// If the allocation is part of an ongoing active deployment, we only allow it to reschedule
 	// if it has been marked eligible
 	if d != nil && alloc.DeploymentID == d.ID && d.Active() && !alloc.DesiredTransition.ShouldReschedule() {
+		logger.Warn("reschedule: alloc blocked by active deployment",
+			"alloc_id", alloc.ID,
+			"job_id", alloc.JobID,
+			"deployment_id", alloc.DeploymentID,
+			"deployment_status", d.Status,
+			"should_reschedule", alloc.DesiredTransition.ShouldReschedule(),
+		)
 		return
 	}
 
 	// Check if the allocation is marked as it should be force rescheduled
 	if alloc.DesiredTransition.ShouldForceReschedule() {
+		logger.Warn("reschedule: alloc force reschedule requested",
+			"alloc_id", alloc.ID,
+			"job_id", alloc.JobID,
+		)
 		rescheduleNow = true
 	}
 
@@ -530,23 +596,104 @@ func updateByReschedulable(alloc *structs.Allocation, now time.Time, evalID stri
 	switch {
 	case isDisconnecting:
 		rescheduleTime, eligible = alloc.RescheduleTimeOnDisconnect(now)
+		logger.Warn("reschedule: checking disconnect case",
+			"alloc_id", alloc.ID,
+			"job_id", alloc.JobID,
+			"reschedule_time", rescheduleTime,
+			"eligible", eligible,
+		)
 
 	case alloc.ClientStatus == structs.AllocClientStatusUnknown && alloc.FollowupEvalID == evalID:
 		lastDisconnectTime := alloc.LastUnknown()
 		rescheduleTime, eligible = alloc.NextRescheduleTimeByTime(lastDisconnectTime)
+		logger.Warn("reschedule: checking unknown client status case",
+			"alloc_id", alloc.ID,
+			"job_id", alloc.JobID,
+			"last_disconnect_time", lastDisconnectTime,
+			"reschedule_time", rescheduleTime,
+			"eligible", eligible,
+		)
 
 	default:
 		rescheduleTime, eligible = alloc.NextRescheduleTime()
+		// Log detailed reschedule eligibility info
+		policy := alloc.ReschedulePolicy()
+		failTime := alloc.LastEventTime()
+		logger.Warn("reschedule: checking NextRescheduleTime",
+			"alloc_id", alloc.ID,
+			"job_id", alloc.JobID,
+			"task_group", alloc.TaskGroup,
+			"client_status", alloc.ClientStatus,
+			"desired_status", alloc.DesiredStatus,
+			"reschedule_time", rescheduleTime,
+			"eligible", eligible,
+			"fail_time", failTime,
+			"now", now,
+			"policy_attempts", func() int {
+				if policy != nil {
+					return policy.Attempts
+				}
+				return -1
+			}(),
+			"policy_unlimited", func() bool {
+				if policy != nil {
+					return policy.Unlimited
+				}
+				return false
+			}(),
+			"policy_delay", func() time.Duration {
+				if policy != nil {
+					return policy.Delay
+				}
+				return 0
+			}(),
+			"policy_interval", func() time.Duration {
+				if policy != nil {
+					return policy.Interval
+				}
+				return 0
+			}(),
+			"followup_eval_id", alloc.FollowupEvalID,
+			"eval_id", evalID,
+			"next_allocation", alloc.NextAllocation,
+			"reschedule_tracker_events", func() int {
+				if alloc.RescheduleTracker != nil {
+					return len(alloc.RescheduleTracker.Events)
+				}
+				return 0
+			}(),
+		)
 	}
 
 	if eligible && (alloc.FollowupEvalID == evalID || rescheduleTime.Sub(now) <= rescheduleWindowSize) {
 		rescheduleNow = true
+		logger.Warn("reschedule: eligible NOW - within window",
+			"alloc_id", alloc.ID,
+			"job_id", alloc.JobID,
+			"reschedule_time", rescheduleTime,
+			"time_until_reschedule", rescheduleTime.Sub(now),
+			"window_size", rescheduleWindowSize,
+		)
 		return
 	}
 
 	if eligible && (alloc.FollowupEvalID == "" || isDisconnecting) {
 		rescheduleLater = true
+		logger.Warn("reschedule: eligible LATER",
+			"alloc_id", alloc.ID,
+			"job_id", alloc.JobID,
+			"reschedule_time", rescheduleTime,
+			"time_until_reschedule", rescheduleTime.Sub(now),
+		)
 	}
+
+	logger.Warn("reschedule: final decision",
+		"alloc_id", alloc.ID,
+		"job_id", alloc.JobID,
+		"reschedule_now", rescheduleNow,
+		"reschedule_later", rescheduleLater,
+		"eligible", eligible,
+	)
 
 	return
 }
