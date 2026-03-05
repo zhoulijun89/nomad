@@ -713,7 +713,7 @@ func updateByReschedulable(logger log.Logger, alloc *structs.Allocation, now tim
 
 	// 【立即重新调度判断】满足以下条件之一可以立即重新调度：
 	// 1. 当前 Evaluation 是分配的后续 Evaluation（FollowupEvalID == evalID）
-	// 2. 重新调度时间在调度窗口内（rescheduleWindowSize = 5秒）
+	// 2. 重新调度时间在调度窗口内（rescheduleWindowSize = 1秒）
 	//    这允许稍微提前到达的 Evaluation 也能触发重新调度
 	if eligible && (alloc.FollowupEvalID == evalID || rescheduleTime.Sub(now) <= rescheduleWindowSize) {
 		rescheduleNow = true
@@ -729,15 +729,25 @@ func updateByReschedulable(logger log.Logger, alloc *structs.Allocation, now tim
 
 	// 【延迟重新调度判断】满足以下条件需要延迟重新调度：
 	// 1. 分配有资格重新调度(eligible=true)
-	// 2. 分配没有后续 Evaluation（FollowupEvalID == ""）或者正在断开连接
-	// 这会创建一个新的后续 Evaluation，在指定时间触发
-	if eligible && (alloc.FollowupEvalID == "" || isDisconnecting) {
+	// 2. 满足以下条件之一：
+	//    - 分配没有后续 Evaluation（FollowupEvalID == ""）
+	//    - 正在断开连接
+	//    - 后续 Evaluation 已过期（rescheduleTime 已过）
+	// 注意：走到这里说明第一个 if 没有进入
+	//       即 FollowupEvalID != evalID 且 rescheduleTime.Sub(now) > rescheduleWindowSize
+	// 如果 FollowupEvalID 不为空且 rescheduleTime 还在未来：
+	//   - 后续 eval 可能正常存在，等待 WaitUntil 时间
+	//   - 不应该重复创建
+	//   - 但如果后续 eval 丢失，需要等 rescheduleTime 过期后才能恢复
+	if eligible && (alloc.FollowupEvalID == "" || isDisconnecting || rescheduleTime.Before(now)) {
 		rescheduleLater = true
 		logger.Warn("重调度: 符合延迟调度条件",
 			"alloc_id", alloc.ID,
 			"job_id", alloc.JobID,
 			"reschedule_time", rescheduleTime,
 			"time_until_reschedule", rescheduleTime.Sub(now),
+			"followup_eval_id", alloc.FollowupEvalID,
+			"followup_eval_expired", rescheduleTime.Before(now),
 		)
 	}
 
