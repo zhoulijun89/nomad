@@ -788,11 +788,6 @@ func (a *allocReconciler) computeUnderProvisionedBy(group *structs.TaskGroup, un
 
 // computePlacements returns the set of allocations to place given the group
 // definition, the set of untainted, migrating and reschedule allocations for the group.
-// 返回需要放置的分配集合，确保达到任务组期望的数量 (group.Count)。
-//
-// 阶段1：添加重新调度的分
-// 阶段2：为 Lost 分配创建替换
-// 阶段3：创建新分配以满足数量
 //
 // Placements will meet or exceed group count.
 func (a *allocReconciler) computePlacements(group *structs.TaskGroup,
@@ -813,15 +808,6 @@ func (a *allocReconciler) computePlacements(group *structs.TaskGroup,
 			minJobVersion:      alloc.Job.Version,
 			lost:               false,
 		})
-
-		a.logger.Warn("重新调度: 立即分配",
-			"job_id", alloc.JobID,
-			"name", alloc.Name,
-			"task_group", alloc.TaskGroup,
-			"pre_alloc_id", alloc.ID,
-			"reschedule", true,
-			"lost", false,
-		)
 	}
 
 	// Add replacements for disconnected and lost allocs up to group.Count
@@ -832,16 +818,6 @@ func (a *allocReconciler) computePlacements(group *structs.TaskGroup,
 		if existing >= group.Count {
 			// Reached desired count, do not replace remaining lost
 			// allocs
-			a.logger.Warn("重新调度util: lost 跳过分配: existing >  group_count ",
-				"alloc_id", alloc.ID,
-				"job_id", alloc.JobID,
-				"task_group", alloc.TaskGroup,
-				"existing", existing,
-				"group_count", group.Count,
-				"len(untainted)", len(untainted),
-				"len(migrate)", len(migrate),
-				"len(reschedule)", len(reschedule),
-			)
 			break
 		}
 
@@ -856,14 +832,6 @@ func (a *allocReconciler) computePlacements(group *structs.TaskGroup,
 			minJobVersion:      alloc.Job.Version,
 			lost:               true,
 		})
-		a.logger.Warn("重新调度: lost立即分配",
-			"job_id", alloc.JobID,
-			"name", alloc.Name,
-			"task_group", alloc.TaskGroup,
-			"pre_alloc_id", alloc.ID,
-			"reschedule", false,
-			"lost", true,
-		)
 	}
 
 	// Add remaining placement results
@@ -876,10 +844,6 @@ func (a *allocReconciler) computePlacements(group *structs.TaskGroup,
 			})
 		}
 	}
-	a.logger.Warn("重新调度util: 需要立即调度的place: ",
-		"task_group", group,
-		"len(place)", len(place),
-	)
 
 	return place
 }
@@ -903,18 +867,6 @@ func (a *allocReconciler) computeReplacements(deploymentPlaceReady bool, desired
 		}
 	}
 
-	// 记录方法入口信息
-	a.logger.Info("computeReplacements: 开始处理放置决策",
-		"deploymentPlaceReady", deploymentPlaceReady,
-		"len(place)", len(place),
-		"len(rescheduleNow)", len(rescheduleNow),
-		"len(lost)", len(lost),
-		"len(failed)", len(failed),
-		"underProvisionedBy", underProvisionedBy,
-		"deploymentPaused", a.deploymentPaused,
-		"deploymentFailed", a.deploymentFailed,
-	)
-
 	// If the deployment is place ready, apply all placements and return
 	if deploymentPlaceReady {
 		desiredChanges.Place += uint64(len(place))
@@ -922,43 +874,11 @@ func (a *allocReconciler) computeReplacements(deploymentPlaceReady bool, desired
 		// turn relies on len(lostLater) == 0.
 		a.result.place = append(a.result.place, place...)
 
-		// 记录所有放置被添加
-		for _, p := range place {
-			a.logger.Info("computeReplacements: 放置已添加（部署正常）",
-				"分配名称", p.Name(),
-				"任务组", p.TaskGroup().Name,
-				"是否重调度", p.IsRescheduling(),
-				"是否金丝雀", p.Canary(),
-				"前序分配ID", func() string {
-					if p.PreviousAllocation() != nil {
-						return p.PreviousAllocation().ID
-					}
-					return "无"
-				}(),
-			)
-		}
-
 		a.markStop(failed, "", allocRescheduled)
 		desiredChanges.Stop += uint64(len(failed))
 
-		// 记录停止的失败分配
-		for _, alloc := range failed {
-			a.logger.Info("computeReplacements: 失败分配已标记停止",
-				"分配ID", alloc.ID,
-				"分配名称", alloc.Name,
-				"任务组", alloc.TaskGroup,
-			)
-		}
-
 		minimum := min(len(place), underProvisionedBy)
 		underProvisionedBy -= minimum
-
-		a.logger.Info("computeReplacements: 部署正常，所有放置已处理",
-			"添加数量", len(place),
-			"停止失败数量", len(failed),
-			"剩余underProvisionedBy", underProvisionedBy,
-		)
-
 		return underProvisionedBy
 	}
 
@@ -972,48 +892,16 @@ func (a *allocReconciler) computeReplacements(deploymentPlaceReady bool, desired
 		allowed := min(len(lost), len(place))
 		desiredChanges.Place += uint64(allowed)
 		a.result.place = append(a.result.place, place[:allowed]...)
-
-		// 记录 lost 分配的替换放置
-		a.logger.Info("computeReplacements: 处理lost分配替换",
-			"lost数量", len(lost),
-			"允许替换数量", allowed,
-			"place总数", len(place),
-		)
-		for i := 0; i < allowed; i++ {
-			p := place[i]
-			a.logger.Info("computeReplacements: lost替换已添加",
-				"分配名称", p.Name(),
-				"任务组", p.TaskGroup().Name,
-				"是否重调度", p.IsRescheduling(),
-				"前序分配ID", func() string {
-					if p.PreviousAllocation() != nil {
-						return p.PreviousAllocation().ID
-					}
-					return "无"
-				}(),
-			)
-		}
 	}
 
 	// if no failures or there are no pending placements return.
 	if len(rescheduleNow) == 0 || len(place) == 0 {
-		a.logger.Info("computeReplacements: 无需处理重调度",
-			"len(rescheduleNow)", len(rescheduleNow),
-			"len(place)", len(place),
-		)
 		return underProvisionedBy
 	}
 
 	// Handle rescheduling of failed allocations even if the deployment is failed.
 	// If the placement is rescheduling, and not part of a failed deployment, add
 	// to the place set. Add the previous alloc to the stop set unless it is disconnecting.
-	a.logger.Info("computeReplacements: 部署异常，检查是否需要重调度",
-		"deploymentFailed", a.deploymentFailed,
-		"len(place)", len(place),
-	)
-
-	addedCount := 0
-	skippedCount := 0
 	for _, p := range place {
 		prev := p.PreviousAllocation()
 		partOfFailedDeployment := a.deploymentFailed && prev != nil && a.deployment.ID == prev.DeploymentID
@@ -1021,27 +909,9 @@ func (a *allocReconciler) computeReplacements(deploymentPlaceReady bool, desired
 		if !partOfFailedDeployment && p.IsRescheduling() {
 			a.result.place = append(a.result.place, p)
 			desiredChanges.Place++
-			addedCount++
-
-			a.logger.Info("computeReplacements: 重调度放置已添加",
-				"分配名称", p.Name(),
-				"任务组", p.TaskGroup().Name,
-				"是否重调度", p.IsRescheduling(),
-				"是否金丝雀", p.Canary(),
-				"前序分配ID", func() string {
-					if prev != nil {
-						return prev.ID
-					}
-					return "无"
-				}(),
-				"partOfFailedDeployment", partOfFailedDeployment,
-			)
 
 			_, prevIsDisconnecting := a.result.disconnectUpdates[prev.ID]
 			if prevIsDisconnecting {
-				a.logger.Info("computeReplacements: 前序分配正在断开，跳过停止",
-					"前序分配ID", prev.ID,
-				)
 				continue
 			}
 
@@ -1050,36 +920,8 @@ func (a *allocReconciler) computeReplacements(deploymentPlaceReady bool, desired
 				statusDescription: allocRescheduled,
 			})
 			desiredChanges.Stop++
-
-			a.logger.Info("computeReplacements: 前序分配已标记停止",
-				"前序分配ID", prev.ID,
-				"前序分配名称", prev.Name,
-			)
-		} else {
-			skippedCount++
-			a.logger.Info("computeReplacements: 放置被跳过",
-				"分配名称", p.Name(),
-				"是否重调度", p.IsRescheduling(),
-				"partOfFailedDeployment", partOfFailedDeployment,
-				"原因", func() string {
-					if partOfFailedDeployment {
-						return "属于失败的部署"
-					}
-					if !p.IsRescheduling() {
-						return "不是重调度类型"
-					}
-					return "未知"
-				}(),
-			)
 		}
 	}
-
-	a.logger.Info("computeReplacements: 部署异常处理完成",
-		"添加数量", addedCount,
-		"跳过数量", skippedCount,
-		"desiredChanges.Place", desiredChanges.Place,
-		"desiredChanges.Stop", desiredChanges.Stop,
-	)
 
 	return underProvisionedBy
 }
@@ -1555,7 +1397,7 @@ func (a *allocReconciler) createLostLaterEvals(rescheduleLater []*delayedResched
 	}
 
 	a.appendFollowupEvals(tgName, evals)
-	a.logger.Warn("一批重新调度的Eval: %v", allocIDToFollowupEvalID)
+
 	return allocIDToFollowupEvalID
 }
 

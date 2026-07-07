@@ -509,21 +509,6 @@ func (s *GenericScheduler) downgradedJobForPlacement(p placementResult) (string,
 
 // computePlacements computes placements for allocations. It is given the set of
 // destructive updates to place and the set of new placements to place.
-/**
-	实际执行节点选择和分配创建的核心方法
-
-	整体流程
-  ┌─────────────────────────────────────────────────────────────┐
-  │  1. 设置节点池（setNodes）                                    │
-  │  2. 先处理 destructive（破坏性更新）                          	│
-  │  3. 再处理 place（新放置）                                    	│
-  │     ├─ 找优选节点                             				│
-  │     ├─ 停止旧分配                   							│
-  │     ├─ 选择节点                                 				│
-  │     ├─ 创建新分配                               				│
-  │     └─ 处理抢占                              				│
-  └─────────────────────────────────────────────────────────────┘
-*/
 func (s *GenericScheduler) computePlacements(destructive, place []placementResult, nameIndex map[string]*allocNameIndex) error {
 
 	// Get the base nodes
@@ -543,15 +528,6 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 	// Have to handle destructive changes first as we need to discount their
 	// resources. To understand this imagine the resources were reduced and the
 	// count was scaled up.
-	// 必须先处理破坏性更新，因为需要释放其资源。想象资源被减少且数量被扩大的场景
-
-	// 记录调度开始信息
-	s.logger.Info("开始计算放置位置",
-		"破坏性更新数量", len(destructive),
-		"新放置数量", len(place),
-		"作业ID", s.job.ID,
-		"可用节点数", len(nodes))
-
 	for _, results := range [][]placementResult{destructive, place} {
 		for _, missing := range results {
 			// Get the task group
@@ -733,32 +709,6 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 				// Track the placement
 				s.plan.AppendAlloc(alloc, downgradedJob)
 
-				// 判断是否为破坏性更新（通过检查missing是否属于destructive集合）
-				isDestructive := false
-				for _, d := range destructive {
-					if d.Name() == missing.Name() {
-						isDestructive = true
-						break
-					}
-				}
-
-				// 记录成功调度的放置
-				s.logger.Info("放置调度成功",
-					"分配名称", alloc.Name,
-					"分配ID", alloc.ID,
-					"任务组", tg.Name,
-					"目标节点ID", option.Node.ID,
-					"目标节点名称", option.Node.Name,
-					"是否金丝雀", missing.Canary(),
-					"是否重调度", missing.IsRescheduling(),
-					"是否破坏性更新", isDestructive,
-					"前序分配ID", func() string {
-						if prevAllocation != nil {
-							return prevAllocation.ID
-						}
-						return "无"
-					}())
-
 			} else {
 				// Lazy initialize the failed map
 				if s.failedTGAllocs == nil {
@@ -770,20 +720,6 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 
 				// Track the fact that we didn't find a placement
 				s.failedTGAllocs[tg.Name] = s.ctx.Metrics()
-
-				// 记录调度失败的放置
-				s.logger.Warn("放置调度失败",
-					"分配名称", missing.Name(),
-					"任务组", tg.Name,
-					"是否金丝雀", missing.Canary(),
-					"是否重调度", missing.IsRescheduling(),
-					"前序分配ID", func() string {
-						if prevAllocation != nil {
-							return prevAllocation.ID
-						}
-						return "无"
-					}(),
-					"失败原因", "未找到满足条件的节点")
 
 				// If we weren't able to find a placement for the allocation, back
 				// out the fact that we asked to stop the allocation.
@@ -807,25 +743,6 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 
 		}
 	}
-
-	// 记录调度汇总信息
-	s.logger.Info("放置计算完成",
-		"作业ID", s.job.ID,
-		"成功调度数量", len(destructive)+len(place)-len(s.failedTGAllocs),
-		"失败调度数量", len(s.failedTGAllocs),
-		"失败的任务组", func() string {
-			if len(s.failedTGAllocs) == 0 {
-				return "无"
-			}
-			groups := ""
-			for tgName := range s.failedTGAllocs {
-				if groups != "" {
-					groups += ", "
-				}
-				groups += tgName
-			}
-			return groups
-		}())
 
 	return nil
 }
