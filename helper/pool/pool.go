@@ -100,7 +100,8 @@ func (c *Conn) getRPCClient() (*StreamClient, error) {
 
 	// Set a deadline for the initial write
 	// 为初始写入设置 2 秒超时
-	if err := stream.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	// 2026-07-07 在高负载情况下，2秒还是时间太短了。设置为10s
+	if err := stream.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		stream.Close()
 		return nil, fmt.Errorf("failed to set stream deadline: %w", err)
 	}
@@ -397,8 +398,8 @@ func (p *ConnPool) getNewConn(region string, addr net.Addr) (*Conn, error) {
 	// 使用 2 秒超时以快速检测网络故障（如网口 down）
 	dialStart := time.Now()
 	p.logger.Printf("[DEBUG] attempting TCP connection to %s", addr.String())
-
-	conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+	//2026-07-07 在高负载情况下，2秒还是时间太短了。还原为10s
+	conn, err := net.DialTimeout("tcp", addr.String(), 10*time.Second)
 	dialDuration := time.Since(dialStart)
 
 	if err != nil {
@@ -581,10 +582,10 @@ func getRPCTimeout(method string) time.Duration {
 	switch method {
 	case "Node.UpdateStatus":
 		// 心跳请求，使用 2 秒快速超时以实现快速故障检测
-		return 2 * time.Second
+		return 10 * time.Second
 	case "Node.Register":
 		// 节点注册，使用 2 秒快速超时以实现快速故障检测
-		return 2 * time.Second
+		return 10 * time.Second
 	default:
 		// 默认 10 秒超时，适用于大多数 RPC
 		return 600 * time.Second

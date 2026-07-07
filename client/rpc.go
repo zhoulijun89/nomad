@@ -280,7 +280,8 @@ func bridgedStreamingRpcHandler(sideA io.ReadWriteCloser) structs.StreamingRpcHa
 func (c *Client) streamingRpcConn(server *servers.Server, method string) (net.Conn, error) {
 	// Dial the server
 	// 使用 2 秒超时以快速检测网络故障
-	conn, err := net.DialTimeout("tcp", server.Addr.String(), 2*time.Second)
+	// 2026-07-07 在高负载情况下，2秒还是时间太短了。还原为10s
+	conn, err := net.DialTimeout("tcp", server.Addr.String(), 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +294,8 @@ func (c *Client) streamingRpcConn(server *servers.Server, method string) (net.Co
 
 	// Set a timeout for the streaming RPC handshake
 	// 为流式 RPC 握手设置 5 秒超时
-	handshakeDeadline := time.Now().Add(2 * time.Second)
+	// 2026-07-07 在高负载情况下，2秒还是时间太短了。设置为10s
+	handshakeDeadline := time.Now().Add(10 * time.Second)
 	if err := conn.SetDeadline(handshakeDeadline); err != nil {
 		c.logger.Warn("failed to set streaming handshake deadline", "error", err)
 	}
