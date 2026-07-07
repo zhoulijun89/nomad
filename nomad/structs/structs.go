@@ -10748,14 +10748,6 @@ func (rt *RescheduleTracker) Copy() *RescheduleTracker {
 	return nt
 }
 
-// RescheduleEligible 根据重调度策略判断分配是否有资格被重新调度
-//
-// 判断逻辑：
-// 1. 如果策略为 nil -> 无资格
-// 2. 如果策略未启用（Attempts=0 且 Unlimited=false）-> 无资格
-// 3. 如果策略允许无限重调度（Unlimited=true）-> 有资格
-// 4. 如果没有历史重调度尝试且 Attempts > 0 -> 有资格
-// 5. 计算 Interval 时间窗口内的重调度次数，如果小于 Attempts -> 有资格
 func (rt *RescheduleTracker) RescheduleEligible(reschedulePolicy *ReschedulePolicy, failTime time.Time) bool {
 	if reschedulePolicy == nil {
 		return false
@@ -10768,7 +10760,7 @@ func (rt *RescheduleTracker) RescheduleEligible(reschedulePolicy *ReschedulePoli
 	if reschedulePolicy.Unlimited {
 		return true
 	}
-	// 如果还没有任何重调度尝试且允许的尝试次数 > 0，提前返回 true
+	// Early return true if there are no attempts yet and the number of allowed attempts is > 0
 	if (rt == nil || len(rt.Events) == 0) && attempts > 0 {
 		return true
 	}
@@ -10776,15 +10768,6 @@ func (rt *RescheduleTracker) RescheduleEligible(reschedulePolicy *ReschedulePoli
 	return attempted < attempts
 }
 
-// rescheduleInfo 计算在 Interval 时间窗口内的重调度次数和允许的最大次数
-//
-// 返回值：
-//   - int: 在 Interval 时间窗口内已经进行的重调度次数
-//   - int: 策略允许的最大重调度次数
-//
-// 计算逻辑：
-// 从后往前遍历重调度事件，统计在 failTime - Interval 时间范围内的事件数量
-// 这样可以实现"滑动窗口"的重调度限制，而不是硬性的总次数限制
 func (rt *RescheduleTracker) rescheduleInfo(reschedulePolicy *ReschedulePolicy, failTime time.Time) (int, int) {
 	if reschedulePolicy == nil {
 		return 0, 0
@@ -10794,11 +10777,9 @@ func (rt *RescheduleTracker) rescheduleInfo(reschedulePolicy *ReschedulePolicy, 
 
 	attempted := 0
 	if rt != nil && attempts > 0 {
-		// 从后往前遍历重调度事件
 		for j := len(rt.Events) - 1; j >= 0; j-- {
 			lastAttempt := rt.Events[j].RescheduleTime
 			timeDiff := failTime.UTC().UnixNano() - lastAttempt
-			// 只统计在 Interval 时间窗口内的事件
 			if timeDiff < interval.Nanoseconds() {
 				attempted += 1
 			}
@@ -11275,13 +11256,8 @@ func (a *Allocation) ClientTerminalStatus() bool {
 
 // ShouldReschedule returns if the allocation is eligible to be rescheduled according
 // to its status and ReschedulePolicy given its failure time
-// ShouldReschedule 判断分配是否应该被重新调度
-// 判断逻辑：
-// 1. 如果期望状态是 stop 或 evict -> 不重新调度
-// 2. 如果客户端状态是 failed -> 根据 ReschedulePolicy 判断是否有资格重新调度
-// 3. 其他情况 -> 不重新调度
 func (a *Allocation) ShouldReschedule(reschedulePolicy *ReschedulePolicy, failTime time.Time) bool {
-	// 首先检查期望状态
+	// First check the desired state
 	switch a.DesiredStatus {
 	case AllocDesiredStatusStop, AllocDesiredStatusEvict:
 		return false
@@ -11295,14 +11271,8 @@ func (a *Allocation) ShouldReschedule(reschedulePolicy *ReschedulePolicy, failTi
 	}
 }
 
-// RescheduleEligible 根据重调度策略和当前重调度追踪器的状态，
-// 判断分配是否有资格被重新调度
-//
-// 判断逻辑：
-// 1. 如果策略未启用（Attempts=0 且 Unlimited=false）-> 无资格
-// 2. 如果策略允许无限重调度（Unlimited=true）-> 有资格
-// 3. 如果还没有任何重调度尝试且 Attempts > 0 -> 有资格
-// 4. 检查在 Interval 时间窗口内的重调度次数是否小于 Attempts -> 有资格
+// RescheduleEligible returns if the allocation is eligible to be rescheduled according
+// to its ReschedulePolicy and the current state of its reschedule trackers
 func (a *Allocation) RescheduleEligible(reschedulePolicy *ReschedulePolicy, failTime time.Time) bool {
 	return a.RescheduleTracker.RescheduleEligible(reschedulePolicy, failTime)
 }
@@ -11330,7 +11300,7 @@ func (a *Allocation) LastEventTime() time.Time {
 	return lastEventTime
 }
 
-// ReschedulePolicy 返回分配所属 TaskGroup 的重调度策略
+// ReschedulePolicy returns the reschedule policy based on the task group
 func (a *Allocation) ReschedulePolicy() *ReschedulePolicy {
 	tg := a.Job.LookupTaskGroup(a.TaskGroup)
 	if tg == nil {
@@ -11348,28 +11318,17 @@ func (a *Allocation) MigrateStrategy() *MigrateStrategy {
 	return tg.Migrate
 }
 
-// NextRescheduleTime 返回分配有资格被重新调度的时间点，以及是否在策略的间隔内
-//
-// 返回值：
-//   - time.Time: 有资格重新调度的时间点（失败时间 + 延迟）
-//   - bool: 是否有资格重新调度
-//
-// 判断逻辑：
-// 1. 如果重调度未启用（Attempts=0 且 Unlimited=false）-> 无资格
-// 2. 如果期望状态是 stop（非最后一次重调度失败）-> 无资格
-// 3. 如果客户端状态不是 failed 或 lost -> 无资格
-// 4. 如果没有失败时间 -> 无资格
-// 5. 计算 nextRescheduleTime 并检查是否在 Interval 内
+// NextRescheduleTime returns a time on or after which the allocation is eligible to be rescheduled,
+// and whether the next reschedule time is within policy's interval if the policy doesn't allow unlimited reschedules
 func (a *Allocation) NextRescheduleTime() (time.Time, bool) {
 	failTime := a.LastEventTime()
 	reschedulePolicy := a.ReschedulePolicy()
 
-	// 如果重调度未启用，提前返回
+	// If reschedule is disabled, return early
 	if reschedulePolicy == nil || (reschedulePolicy.Attempts == 0 && !reschedulePolicy.Unlimited) {
 		return time.Time{}, false
 	}
 
-	// 检查分配状态是否允许重新调度
 	if (a.DesiredStatus == AllocDesiredStatusStop && !a.LastRescheduleFailed()) ||
 		(a.ClientStatus != AllocClientStatusFailed && a.ClientStatus != AllocClientStatusLost) ||
 		failTime.IsZero() || reschedulePolicy == nil {
@@ -11379,29 +11338,21 @@ func (a *Allocation) NextRescheduleTime() (time.Time, bool) {
 	return a.nextRescheduleTime(failTime, reschedulePolicy)
 }
 
-// nextRescheduleTime 计算下一次重新调度的时间和资格
-//
-// 计算逻辑：
-// 1. 计算下次延迟时间（根据 DelayFunction 和历史重调度次数）
-// 2. 下次重调度时间 = 失败时间 + 延迟
-// 3. 判断是否有资格：
-//   - 如果 Unlimited=true -> 有资格
-//   - 如果 Attempts > 0 且没有历史重调度 -> 有资格
-//   - 如果 Attempts > 0 且有历史重调度 -> 检查在 Interval 内的尝试次数是否小于 Attempts
 func (a *Allocation) nextRescheduleTime(failTime time.Time, reschedulePolicy *ReschedulePolicy) (time.Time, bool) {
 	nextDelay := a.NextDelay()
 	nextRescheduleTime := failTime.Add(nextDelay)
 	rescheduleEligible := reschedulePolicy.Unlimited || (reschedulePolicy.Attempts > 0 && a.RescheduleTracker == nil)
 	if reschedulePolicy.Attempts > 0 && a.RescheduleTracker != nil && a.RescheduleTracker.Events != nil {
-		// 检查基于 Interval 的资格判断
+		// Check for eligibility based on the interval if max attempts is set
 		attempted, attempts := a.RescheduleTracker.rescheduleInfo(reschedulePolicy, failTime)
 		rescheduleEligible = attempted < attempts && nextDelay < reschedulePolicy.Interval
 	}
 	return nextRescheduleTime, rescheduleEligible
 }
 
-// NextRescheduleTimeByTime 类似于 NextRescheduleTime，但允许调用者指定失败时间
-// 这对于判断断开连接节点上的分配是否需要重新调度很有用
+// NextRescheduleTimeByTime works like NextRescheduleTime but allows callers
+// specify a failure time. Useful for things like determining whether to reschedule
+// an alloc on a disconnected node.
 func (a *Allocation) NextRescheduleTimeByTime(t time.Time) (time.Time, bool) {
 	reschedulePolicy := a.ReschedulePolicy()
 	if reschedulePolicy == nil {
@@ -11411,19 +11362,10 @@ func (a *Allocation) NextRescheduleTimeByTime(t time.Time) (time.Time, bool) {
 	return a.nextRescheduleTime(t, reschedulePolicy)
 }
 
-// RescheduleTimeOnDisconnect 返回断开连接时的重新调度时间
-//
-// 返回值：
-//   - time.Time: 重新调度时间
-//   - bool: 是否允许重新调度
-//
-// 逻辑：
-//   - 如果 TaskGroup 配置了 Disconnect.Replace，则立即允许重新调度
-//   - 否则使用 NextRescheduleTimeByTime 保持向后兼容
 func (a *Allocation) RescheduleTimeOnDisconnect(now time.Time) (time.Time, bool) {
 	tg := a.Job.LookupTaskGroup(a.TaskGroup)
 	if tg == nil || tg.Disconnect == nil || tg.Disconnect.Replace == nil {
-		// 保持 1.8.0 之前版本的行为
+		// Kept to maintain backwards compatibility with behavior prior to 1.8.0
 		return a.NextRescheduleTimeByTime(now)
 	}
 
@@ -11523,38 +11465,28 @@ func (a *Allocation) PreventReplaceOnDisconnect() bool {
 	return false
 }
 
-// NextDelay 返回分配可以被重新调度前的延迟时间
-// 根据延迟函数和之前的重调度尝试次数计算
-//
-// 延迟函数类型：
-//   - "constant": 固定延迟，每次都是 policy.Delay
-//   - "exponential": 指数增长，每次延迟 = 上次延迟 * 2
-//   - "fibonacci": 斐波那契数列，每次延迟 = 前两次延迟之和
-//
-// 如果延迟超过 MaxDelay，则使用 MaxDelay
-// 如果超过 MaxDelay 后经过足够长的时间，延迟会重置为初始值
+// NextDelay returns a duration after which the allocation can be rescheduled.
+// It is calculated according to the delay function and previous reschedule attempts.
 func (a *Allocation) NextDelay() time.Duration {
 	policy := a.ReschedulePolicy()
-	// 如果 TaskGroup 被更新移除了重调度策略，可能为 nil
+	// Can be nil if the task group was updated to remove its reschedule policy
 	if policy == nil {
 		return 0
 	}
 	delayDur := policy.Delay
-	// 如果没有历史重调度尝试，使用初始延迟
 	if a.RescheduleTracker == nil || a.RescheduleTracker.Events == nil || len(a.RescheduleTracker.Events) == 0 {
 		return delayDur
 	}
 	events := a.RescheduleTracker.Events
 	switch policy.DelayFunction {
 	case "exponential":
-		// 指数增长：每次延迟翻倍
 		delayDur = a.RescheduleTracker.Events[len(a.RescheduleTracker.Events)-1].Delay * 2
 	case "fibonacci":
-		// 斐波那契：前两次延迟之和
 		if len(events) >= 2 {
 			fibN1Delay := events[len(events)-1].Delay
 			fibN2Delay := events[len(events)-2].Delay
-			// 处理延迟上限重置，应该开始新的数列
+			// Handle reset of delay ceiling which should cause
+			// a new series to start
 			if fibN2Delay == policy.MaxDelay && fibN1Delay == policy.Delay {
 				delayDur = fibN1Delay
 			} else {
@@ -11562,14 +11494,12 @@ func (a *Allocation) NextDelay() time.Duration {
 			}
 		}
 	default:
-		// "constant" 或其他情况：使用固定延迟
 		return delayDur
 	}
-	// 应用最大延迟限制
 	if policy.MaxDelay > 0 && delayDur > policy.MaxDelay {
 		delayDur = policy.MaxDelay
-		// 检查是否需要重置延迟
-		// 如果距离上次重调度超过延迟时间，说明已经"冷却"，重置为初始延迟
+		// check if delay needs to be reset
+
 		lastRescheduleEvent := a.RescheduleTracker.Events[len(a.RescheduleTracker.Events)-1]
 		timeDiff := a.LastEventTime().UTC().UnixNano() - lastRescheduleEvent.RescheduleTime
 		if timeDiff > delayDur.Nanoseconds() {

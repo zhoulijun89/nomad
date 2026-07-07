@@ -11,11 +11,12 @@ package scheduler
 import (
 	"errors"
 	"fmt"
-	log "github.com/hashicorp/go-hclog"
 	"slices"
 	"sort"
 	"strings"
 	"time"
+
+	log "github.com/hashicorp/go-hclog"
 
 	"github.com/hashicorp/nomad/nomad/structs"
 )
@@ -401,26 +402,20 @@ func (a allocSet) filterByTainted(taintedNodes map[string]*structs.Node, serverS
 	return
 }
 
-// filterByRescheduleable 过滤分配集合，返回以下三类分配：
-// 1. untainted: 不需要重新调度的分配（已成功完成或不符合重调度条件）
-// 2. rescheduleNow: 需要立即重新调度的分配
-// 3. rescheduleLater: 需要延迟重新调度的分配（会创建后续的 Evaluation）
-//
-// 重新调度的核心判断流程：
-// 1. 检查分配是否已经在断开连接状态下为 unknown 状态 -> 跳过
-// 2. 检查分配是否已经有后续分配（NextAllocation 不为空）-> 跳过，避免重复调度
-// 3. 调用 shouldFilter 判断是否应该过滤（batch 和 service 有不同逻辑）
-// 4. 调用 updateByReschedulable 判断是否可以立即/延迟重新调度
+// filterByRescheduleable filters the allocation set to return the set of allocations that are either
+// untainted or a set of allocations that must be rescheduled now. Allocations that can be rescheduled
+// at a future time are also returned so that we can create follow up evaluations for them. Allocs are
+// skipped or considered untainted according to logic defined in shouldFilter method.
 func (a allocSet) filterByRescheduleable(logger log.Logger, isBatch, isDisconnecting bool, now time.Time, evalID string, deployment *structs.Deployment) (allocSet, allocSet, []*delayedRescheduleInfo) {
 	untainted := make(map[string]*structs.Allocation)
 	rescheduleNow := make(map[string]*structs.Allocation)
 	rescheduleLater := []*delayedRescheduleInfo{}
 
 	for _, alloc := range a {
-		// 【跳过条件1】断开连接状态下已经是 unknown 的分配，避免重复处理
-		// 这种情况可能发生在 canary 被断开连接打断时
+		// Ignore disconnecting allocs that are already unknown. This can happen
+		// in the case of canaries that are interrupted by a disconnect.
 		if isDisconnecting && alloc.ClientStatus == structs.AllocClientStatusUnknown {
-			logger.Warn("重调度: 跳过分配 - 正在断开连接且已经是 unknown 状态",
+			logger.Warn("reschedule: skipping alloc - disconnecting and already unknown",
 				"alloc_id", alloc.ID,
 				"job_id", alloc.JobID,
 				"task_group", alloc.TaskGroup,
@@ -432,11 +427,11 @@ func (a allocSet) filterByRescheduleable(logger log.Logger, isBatch, isDisconnec
 		var eligibleNow, eligibleLater bool
 		var rescheduleTime time.Time
 
-		// 【跳过条件2】已经有后续分配的终端状态分配
-		// 只有 failed 或 disconnecting 状态的分配才应该被重新调度
-		// 这个检查防止对正在运行的分配进行重复调度（历史 bug 的防护）
+		// Ignore failing allocs that have already been rescheduled.
+		// Only failed or disconnecting allocs should be rescheduled.
+		// Protects against a bug allowing rescheduling running allocs.
 		if alloc.NextAllocation != "" && alloc.TerminalStatus() {
-			logger.Warn("重调度: 跳过分配 - 已经有后续分配",
+			logger.Warn("reschedule: skipping alloc - already has next allocation",
 				"alloc_id", alloc.ID,
 				"job_id", alloc.JobID,
 				"task_group", alloc.TaskGroup,
@@ -447,12 +442,9 @@ func (a allocSet) filterByRescheduleable(logger log.Logger, isBatch, isDisconnec
 			continue
 		}
 
-		// 【过滤判断】调用 shouldFilter 判断分配是否应该被过滤
-		// isUntainted=true 表示分配已完成，计入期望总数，不需要重新调度
-		// ignore=true 表示分配应该被完全忽略（如已停止的分配）
 		isUntainted, ignore := shouldFilter(alloc, isBatch)
 		if isUntainted && !isDisconnecting {
-			logger.Warn("重调度: 分配标记为 untainted - 不会重新调度",
+			logger.Warn("reschedule: alloc marked as untainted - will not reschedule",
 				"alloc_id", alloc.ID,
 				"job_id", alloc.JobID,
 				"task_group", alloc.TaskGroup,
@@ -461,11 +453,11 @@ func (a allocSet) filterByRescheduleable(logger log.Logger, isBatch, isDisconnec
 				"is_batch", isBatch,
 			)
 			untainted[alloc.ID] = alloc
-			continue // 这些分配永远不会被重新调度，跳过后续检查
+			continue // these allocs can never be rescheduled, so skip checking
 		}
 
 		if ignore {
-			logger.Warn("重调度: 分配被 shouldFilter 忽略",
+			logger.Warn("reschedule: alloc ignored by shouldFilter",
 				"alloc_id", alloc.ID,
 				"job_id", alloc.JobID,
 				"task_group", alloc.TaskGroup,
@@ -476,12 +468,9 @@ func (a allocSet) filterByRescheduleable(logger log.Logger, isBatch, isDisconnec
 			continue
 		}
 
-		// 【核心判断】调用 updateByReschedulable 判断重新调度的时机
-		// 返回值：eligibleNow=可以立即调度, eligibleLater=可以延迟调度, rescheduleTime=调度时间
 		eligibleNow, eligibleLater, rescheduleTime = updateByReschedulable(logger, alloc, now, evalID, deployment, isDisconnecting)
 		if eligibleNow {
-			// 【立即重新调度】分配满足条件，可以立即重新调度
-			logger.Warn("重调度: 分配符合立即重新调度条件",
+			logger.Warn("reschedule: alloc eligible for reschedule NOW",
 				"alloc_id", alloc.ID,
 				"job_id", alloc.JobID,
 				"task_group", alloc.TaskGroup,
@@ -492,14 +481,12 @@ func (a allocSet) filterByRescheduleable(logger log.Logger, isBatch, isDisconnec
 			continue
 		}
 
-		// 如果分配不满足立即重新调度的条件，将其放入 untainted 集合
-		// 这样可以防止调度器认为需要创建新的分配
+		// If the failed alloc is not eligible for rescheduling now we
+		// add it to the untainted set.
 		untainted[alloc.ID] = alloc
 
 		if eligibleLater {
-			// 【延迟重新调度】分配满足条件，但需要延迟到指定时间
-			// 会创建一个 follow-up Evaluation 在指定时间触发
-			logger.Warn("重调度: 分配符合延迟重新调度条件",
+			logger.Warn("reschedule: alloc eligible for reschedule LATER",
 				"alloc_id", alloc.ID,
 				"job_id", alloc.JobID,
 				"task_group", alloc.TaskGroup,
@@ -509,9 +496,7 @@ func (a allocSet) filterByRescheduleable(logger log.Logger, isBatch, isDisconnec
 			)
 			rescheduleLater = append(rescheduleLater, &delayedRescheduleInfo{alloc.ID, alloc, rescheduleTime})
 		} else {
-			// 【不满足重新调度条件】分配不满足重新调度的条件
-			// 可能原因：达到最大重试次数、超出时间间隔等
-			logger.Warn("重调度: 分配不符合重新调度条件",
+			logger.Warn("reschedule: alloc NOT eligible for reschedule",
 				"alloc_id", alloc.ID,
 				"job_id", alloc.JobID,
 				"task_group", alloc.TaskGroup,
@@ -524,93 +509,70 @@ func (a allocSet) filterByRescheduleable(logger log.Logger, isBatch, isDisconnec
 	return untainted, rescheduleNow, rescheduleLater
 }
 
-// shouldFilter 判断分配是否应该被过滤（忽略或标记为 untainted）
+// shouldFilter returns whether the alloc should be ignored or considered untainted.
 //
-// 返回值：
-//   - untainted: true 表示分配已完成，计入期望总数，不需要重新调度
-//   - ignore: true 表示分配应该被完全忽略，不计入期望总数
+// Ignored allocs are filtered out.
+// Untainted allocs count against the desired total.
+// Filtering logic for batch jobs:
+// If complete, and ran successfully - untainted
+// If desired state is stop - ignore
 //
-// Batch 作业的过滤逻辑：
-//   - 如果已完成且运行成功 -> untainted（不需要替换）
-//   - 如果期望状态是 stop -> 检查是否运行成功或最后一次重调度失败
-//   - 如果客户端状态是 failed -> 需要重新调度（返回 false, false）
-//
-// Service 作业的过滤逻辑：
-//   - 如果期望状态是 stop/evict -> 检查最后一次重调度是否失败
-//   - 如果客户端状态是 complete/lost -> 忽略
+// Filtering logic for service jobs:
+// Never untainted
+// If desired state is stop/evict - ignore
+// If client status is complete/lost - ignore
 func shouldFilter(alloc *structs.Allocation, isBatch bool) (untainted, ignore bool) {
-	// Batch 作业的处理逻辑
-	// Batch 作业完成后如果成功则不需要重新调度
+	// Allocs from batch jobs should be filtered when the desired status
+	// is terminal and the client did not finish or when the client
+	// status is failed so that they will be replaced. If they are
+	// complete but not failed, they shouldn't be replaced.
 	if isBatch {
 		switch alloc.DesiredStatus {
 		case structs.AllocDesiredStatusStop:
-			// 如果分配成功运行完成，标记为 untainted
 			if alloc.RanSuccessfully() {
 				return true, false
 			}
-			// 如果最后一次重调度失败，不标记为 untainted，允许再次尝试
 			if alloc.LastRescheduleFailed() {
 				return false, false
 			}
-			// 其他情况忽略
 			return false, true
 		case structs.AllocDesiredStatusEvict:
-			// 被驱逐的分配忽略
 			return false, true
 		}
 
 		switch alloc.ClientStatus {
 		case structs.AllocClientStatusFailed:
-			// 失败的 batch 作业需要重新调度
 			return false, false
 		}
 
-		// 其他情况标记为 untainted
 		return true, false
 	}
 
-	// Service 作业的处理逻辑
+	// Handle service jobs
 	switch alloc.DesiredStatus {
 	case structs.AllocDesiredStatusStop, structs.AllocDesiredStatusEvict:
-		// 如果最后一次重调度失败，不忽略，允许再次尝试
 		if alloc.LastRescheduleFailed() {
 			return false, false
 		}
-		// 停止或驱逐的分配忽略
+
 		return false, true
 	}
 
 	switch alloc.ClientStatus {
 	case structs.AllocClientStatusComplete, structs.AllocClientStatusLost:
-		// 完成或丢失的分配忽略
 		return false, true
 	}
 
-	// 其他情况不过滤，需要进一步判断是否重新调度
 	return false, false
 }
 
-// updateByReschedulable 判断一个失败的分配是否应该立即/延迟重新调度
-//
-// 返回值：
-//   - rescheduleNow: 是否可以立即重新调度
-//   - rescheduleLater: 是否需要延迟重新调度
-//   - rescheduleTime: 重新调度的时间点
-//
-// 判断逻辑：
-//  1. 如果分配属于正在进行的部署且没有被标记为可重新调度 -> 不允许重新调度
-//  2. 如果分配被标记为强制重新调度(ForceReschedule) -> 立即重新调度
-//  3. 根据不同场景计算重新调度时间：
-//     - 断开连接场景：使用 RescheduleTimeOnDisconnect
-//     - Unknown 状态且匹配 followup eval：使用 NextRescheduleTimeByTime
-//     - 默认场景：使用 NextRescheduleTime
-//  4. 判断是否在调度窗口内（rescheduleWindowSize = 5秒）
+// updateByReschedulable is a helper method that encapsulates logic for whether a failed allocation
+// should be rescheduled now, later or left in the untainted set
 func updateByReschedulable(logger log.Logger, alloc *structs.Allocation, now time.Time, evalID string, d *structs.Deployment, isDisconnecting bool) (rescheduleNow, rescheduleLater bool, rescheduleTime time.Time) {
-	// 【部署检查】如果分配属于正在进行的活跃部署
-	// 只有被显式标记为可重新调度的分配才允许重新调度
-	// 这是为了防止在部署过程中频繁创建失败的分配
+	// If the allocation is part of an ongoing active deployment, we only allow it to reschedule
+	// if it has been marked eligible
 	if d != nil && alloc.DeploymentID == d.ID && d.Active() && !alloc.DesiredTransition.ShouldReschedule() {
-		logger.Warn("重调度: 分配被活跃部署阻止",
+		logger.Warn("reschedule: alloc blocked by active deployment",
 			"alloc_id", alloc.ID,
 			"job_id", alloc.JobID,
 			"deployment_id", alloc.DeploymentID,
@@ -620,24 +582,21 @@ func updateByReschedulable(logger log.Logger, alloc *structs.Allocation, now tim
 		return
 	}
 
-	// 【强制重新调度检查】如果分配被标记为强制重新调度
-	// 操作者可以强制要求重新调度，即使分配不满足常规条件
+	// Check if the allocation is marked as it should be force rescheduled
 	if alloc.DesiredTransition.ShouldForceReschedule() {
-		logger.Warn("重调度: 分配被强制要求重新调度",
+		logger.Warn("reschedule: alloc force reschedule requested",
 			"alloc_id", alloc.ID,
 			"job_id", alloc.JobID,
 		)
 		rescheduleNow = true
 	}
 
-	// 【计算重新调度时间和资格】根据不同场景计算
+	// Reschedule if the eval ID matches the alloc's followup evalID or if its close to its reschedule time
 	var eligible bool
 	switch {
 	case isDisconnecting:
-		// 场景1: 节点断开连接
-		// 使用 RescheduleTimeOnDisconnect 计算调度时间
 		rescheduleTime, eligible = alloc.RescheduleTimeOnDisconnect(now)
-		logger.Warn("重调度: 检查断开连接场景",
+		logger.Warn("reschedule: checking disconnect case",
 			"alloc_id", alloc.ID,
 			"job_id", alloc.JobID,
 			"reschedule_time", rescheduleTime,
@@ -645,11 +604,9 @@ func updateByReschedulable(logger log.Logger, alloc *structs.Allocation, now tim
 		)
 
 	case alloc.ClientStatus == structs.AllocClientStatusUnknown && alloc.FollowupEvalID == evalID:
-		// 场景2: 分配状态为 Unknown 且当前 Evaluation 是其后续 Evaluation
-		// 使用上次断开连接时间计算重新调度时间
 		lastDisconnectTime := alloc.LastUnknown()
 		rescheduleTime, eligible = alloc.NextRescheduleTimeByTime(lastDisconnectTime)
-		logger.Warn("重调度: 检查 unknown 客户端状态场景",
+		logger.Warn("reschedule: checking unknown client status case",
 			"alloc_id", alloc.ID,
 			"job_id", alloc.JobID,
 			"last_disconnect_time", lastDisconnectTime,
@@ -658,14 +615,11 @@ func updateByReschedulable(logger log.Logger, alloc *structs.Allocation, now tim
 		)
 
 	default:
-		// 场景3: 默认情况（失败的分配）
-		// 使用 NextRescheduleTime 计算重新调度时间
-		// 这会考虑 ReschedulePolicy 的 Attempts、Interval、Delay 等参数
 		rescheduleTime, eligible = alloc.NextRescheduleTime()
-		// 记录详细的重新调度资格信息
+		// Log detailed reschedule eligibility info
 		policy := alloc.ReschedulePolicy()
 		failTime := alloc.LastEventTime()
-		logger.Warn("重调度: 检查 NextRescheduleTime",
+		logger.Warn("reschedule: checking NextRescheduleTime",
 			"alloc_id", alloc.ID,
 			"job_id", alloc.JobID,
 			"task_group", alloc.TaskGroup,
@@ -711,13 +665,9 @@ func updateByReschedulable(logger log.Logger, alloc *structs.Allocation, now tim
 		)
 	}
 
-	// 【立即重新调度判断】满足以下条件之一可以立即重新调度：
-	// 1. 当前 Evaluation 是分配的后续 Evaluation（FollowupEvalID == evalID）
-	// 2. 重新调度时间在调度窗口内（rescheduleWindowSize = 5秒）
-	//    这允许稍微提前到达的 Evaluation 也能触发重新调度
 	if eligible && (alloc.FollowupEvalID == evalID || rescheduleTime.Sub(now) <= rescheduleWindowSize) {
 		rescheduleNow = true
-		logger.Warn("重调度: 符合立即调度条件 - 在窗口内",
+		logger.Warn("reschedule: eligible NOW - within window",
 			"alloc_id", alloc.ID,
 			"job_id", alloc.JobID,
 			"reschedule_time", rescheduleTime,
@@ -727,13 +677,9 @@ func updateByReschedulable(logger log.Logger, alloc *structs.Allocation, now tim
 		return
 	}
 
-	// 【延迟重新调度判断】满足以下条件需要延迟重新调度：
-	// 1. 分配有资格重新调度(eligible=true)
-	// 2. 分配没有后续 Evaluation（FollowupEvalID == ""）或者正在断开连接
-	// 这会创建一个新的后续 Evaluation，在指定时间触发
 	if eligible && (alloc.FollowupEvalID == "" || isDisconnecting) {
 		rescheduleLater = true
-		logger.Warn("重调度: 符合延迟调度条件",
+		logger.Warn("reschedule: eligible LATER",
 			"alloc_id", alloc.ID,
 			"job_id", alloc.JobID,
 			"reschedule_time", rescheduleTime,
@@ -741,8 +687,7 @@ func updateByReschedulable(logger log.Logger, alloc *structs.Allocation, now tim
 		)
 	}
 
-	// 记录最终决定
-	logger.Warn("重调度: 最终决定",
+	logger.Warn("reschedule: final decision",
 		"alloc_id", alloc.ID,
 		"job_id", alloc.JobID,
 		"reschedule_now", rescheduleNow,

@@ -691,7 +691,7 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 						original := prevAllocation
 						prevAllocation = prevAllocation.Copy()
 						missing.SetPreviousAllocation(prevAllocation)
-						updateRescheduleTracker(s.logger, alloc, prevAllocation, now)
+						updateRescheduleTracker(alloc, prevAllocation, now)
 						swapAllocInPlan(s.plan, original, prevAllocation)
 					}
 				}
@@ -734,7 +734,7 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 					if missing.IsRescheduling() {
 						updatedPrevAllocation := prevAllocation.Copy()
 						missing.SetPreviousAllocation(prevAllocation)
-						annotateRescheduleTracker(s.logger, updatedPrevAllocation, structs.LastRescheduleFailedToPlace)
+						annotateRescheduleTracker(updatedPrevAllocation, structs.LastRescheduleFailedToPlace)
 						swapAllocInPlan(s.plan, prevAllocation, updatedPrevAllocation)
 					}
 				}
@@ -830,29 +830,21 @@ func getSelectOptions(prevAllocation *structs.Allocation, preferredNode *structs
 
 // annotateRescheduleTracker adds a note about the last reschedule attempt. This
 // mutates the allocation, which should be a copy.
-func annotateRescheduleTracker(logger log.Logger, prev *structs.Allocation, note structs.RescheduleTrackerAnnotation) {
+func annotateRescheduleTracker(prev *structs.Allocation, note structs.RescheduleTrackerAnnotation) {
 	if prev.RescheduleTracker == nil {
 		prev.RescheduleTracker = &structs.RescheduleTracker{}
 	}
 	prev.RescheduleTracker.LastReschedule = note
-	logger.Info("reschedule: annotated reschedule tracker",
-		"prev_alloc_id", prev.ID,
-		"job_id", prev.JobID,
-		"task_group", prev.TaskGroup,
-		"note", note,
-	)
 }
 
 // updateRescheduleTracker carries over previous restart attempts and adds the
 // most recent restart. This mutates both allocations; "alloc" is a new
 // allocation so this is safe, but "prev" is coming from the state store and
 // must be copied first.
-func updateRescheduleTracker(logger log.Logger, alloc *structs.Allocation, prev *structs.Allocation, now time.Time) {
+func updateRescheduleTracker(alloc *structs.Allocation, prev *structs.Allocation, now time.Time) {
 	reschedPolicy := prev.ReschedulePolicy()
 	var rescheduleEvents []*structs.RescheduleEvent
-	prevEventCount := 0
 	if prev.RescheduleTracker != nil {
-		prevEventCount = len(prev.RescheduleTracker.Events)
 		var interval time.Duration
 		if reschedPolicy != nil {
 			interval = reschedPolicy.Interval
@@ -885,20 +877,7 @@ func updateRescheduleTracker(logger log.Logger, alloc *structs.Allocation, prev 
 	alloc.RescheduleTracker = &structs.RescheduleTracker{
 		Events:         rescheduleEvents,
 		LastReschedule: structs.LastRescheduleSuccess}
-
-	logger.Info("reschedule: updated reschedule tracker",
-		"alloc_id", alloc.ID,
-		"prev_alloc_id", prev.ID,
-		"job_id", alloc.JobID,
-		"task_group", alloc.TaskGroup,
-		"prev_node_id", prev.NodeID,
-		"prev_event_count", prevEventCount,
-		"new_event_count", len(rescheduleEvents),
-		"next_delay", nextDelay,
-		"reschedule_time", now.Format(time.RFC3339Nano),
-	)
-
-	annotateRescheduleTracker(logger, prev, structs.LastRescheduleSuccess)
+	annotateRescheduleTracker(prev, structs.LastRescheduleSuccess)
 }
 
 // findPreferredNode finds the preferred node for an allocation
